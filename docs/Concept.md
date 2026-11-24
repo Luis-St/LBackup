@@ -261,7 +261,7 @@ services:
     <<: *hardening
     image: ghcr.io/<owner>/lbackup-agent:<version>
     command: ["manager"]
-    user: "10001:10001"
+    user: "0:0"
     mem_limit: 256m
     volumes:
       - lbackup-agent-state:/state
@@ -293,7 +293,7 @@ services:
     <<: *hardening
     image: ghcr.io/<owner>/lbackup-agent:<version>-postgres
     command: ["worker", "--name", "postgres", "--no-management"]
-    user: "10001:10001"
+    user: "0:0"
     mem_limit: 1g
     networks:
       - default
@@ -310,8 +310,12 @@ volumes:
   lbackup-agent-socket:
 ```
 
-The dedicated management agent and the database workers run as an unprivileged user without any capability and without a host mount,
+The dedicated management agent and the database workers run without any capability and without a host mount,
 because they neither read host files nor need privileges to talk to the server or a database.
+Every agent container runs as UID 0, because the state volume moves between containers during a topology migration,
+and an unprivileged user would not be able to read key files written by the previous owner without `DAC_OVERRIDE` or `CHOWN`.
+UID 0 without capabilities on a read-only root filesystem grants no access beyond ordinary file permissions inside the container.
+It remains host root after a container escape, which is accepted because the file worker already runs as UID 0 for the same reason.
 The socket volume is mounted read-only into the workers,
 because connecting to a Unix socket works on a read-only mount and the workers never need to write there.
 
