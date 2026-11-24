@@ -17,14 +17,17 @@ It is the starting point for all further specification documents and lists the d
   Every feature ships with an automated test in a local VM or container setup before it is considered usable.
 - G6 Backups remain restorable without LBackup.
   Repositories use the restic format, so plain `rustic` or `restic` can open them if the server is lost.
+- G7 Backups follow the 3-2-1 rule without a second tool.
+  The server copies repositories to an off-site backend, because a NAS in one building is a single point of failure for fire, theft and ransomware.
 
 ## Architecture overview
 
 | Component | Runs on | Responsibility |
 | --- | --- | --- |
 | Server | NAS, Docker | Repository storage, configuration, scheduling, web UI, retention, restore orchestration |
-| Agent | VPS, Docker | Reads host data, creates dumps, deduplicates, encrypts and uploads snapshots |
-| Restore agent | VPS, Docker, one-shot | Writes a selected snapshot back to the host, started only on demand |
+| Management agent | VPS, Docker or native systemd service, one per host | Holds the server connection and identity, receives configuration, schedules jobs and relays them to its workers |
+| Worker agent | VPS, Docker, one per image variant | Reads host data or creates dumps for its assigned targets, deduplicates, encrypts and uploads snapshots |
+| Restore agent | VPS, Docker or native binary, one-shot | Writes a selected snapshot back to the host, started only on demand |
 | Web UI | Embedded in the server binary | Administration, agent enrollment wizard, browsing and restore |
 
 The server is a single Rust binary based on `tokio` and `axum`.
@@ -33,11 +36,21 @@ because a single artifact without a separate web server keeps deployment and ver
 The server keeps its own state in SQLite via `sqlx`, because the NAS hosts one instance and an external database would add an operational dependency without benefit.
 
 The agent is a separate Rust binary that embeds `rustic_core` as a library.
+It runs either as management agent or as worker agent, which the section on management and worker agents defines.
 Deduplication, compression and encryption happen on the agent,
 because only changed and already encrypted chunks then cross the network and the NAS never sees plaintext in transit.
 
 Both binaries live in one Cargo workspace with a shared `protocol` crate,
 so that server and agent cannot drift apart in their message definitions.
+
+Server and agent are built for `x86_64` and `aarch64`, as static `musl` binaries and as multi-arch images for `linux/amd64` and `linux/arm64`.
+Both architectures are required, because ARM VPS offers and ARM based NAS devices are common and a missing architecture would exclude them entirely.
+
+The server only requires a generic Docker Engine 24 or newer with Compose v2, independent of the NAS vendor.
+Targeting Synology, TrueNAS or Unraid specifically was rejected,
+because vendor features such as ZFS snapshots are not needed by the design and would bind the project to one platform.
+Version 24 is the minimum because it is the oldest version still shipped by the current NAS platforms.
+The agent hosts need Docker 25, which the container hardening section explains.
 
 ## Repository layout
 
@@ -87,12 +100,39 @@ Client certificates are short-lived and renewed automatically over the control c
 because a stolen certificate then expires without manual action.
 Agents can be revoked in the UI, which closes the connection and rejects the certificate immediately.
 
+### Management and worker agents
+
+A host runs exactly one management agent and one or more worker agents.
+Each target is assigned to a worker whose image covers it,
+so a file backup runs in the plain agent image while a PostgreSQL dump runs in the `-postgres` variant.
+Separate workers were chosen over one container with every client,
+because each worker then gets only the mounts and networks its targets need.
+The file worker holds the read-only host root mount but joins no database network,
+and a database worker joins the database network but never sees the host filesystem.
+
+Only the management agent enrolls, holds the client certificate and connects to the server.
+Workers connect to the management agent over a Unix socket in a shared volume,
+and the management agent relays control messages and bulk data to the server.
+This keeps one identity, one repository and one configuration view per host,
+so the UI shows a host as one agent regardless of how many workers it runs.
+Enrolling every worker separately was rejected, because it would split one host into several agents with separate repositories and configurations.
+Starting workers on demand from the management agent was rejected, because it requires the Docker socket.
+
+The management agent sends each worker only the configuration and credentials of its own targets,
+so a compromised database worker learns nothing about the file targets or other databases.
+It accepts only the worker names listed in its configuration and reports a missing or unknown worker to the UI.
+Every worker of a host writes into the same repository with its key,
+so the limitation on the repository key held by the agent applies per host and not per worker.
+
+The native agent runs management and all targets in one process,
+because without containers there are no separate images and mounts to split.
+
 ### Dynamic configuration
 
 The server holds the full agent configuration and pushes a versioned document whenever it changes.
 The agent acknowledges each version, so the UI can show whether a change has been applied.
 The agent caches the last configuration in its state volume, so it can still report and retry after a restart while the server is unreachable.
-Settings that are fixed at container creation, such as additional bind mounts or Docker networks,
+Settings that are fixed at container creation, such as additional bind mounts, Docker networks or the set of workers,
 cannot be changed at runtime and the UI shows a regenerated command when one of them changes.
 
 ## Agent modes
@@ -118,25 +158,44 @@ The open points list an asymmetric alternative.
 
 ## Container hardening of the agent
 
-The agent container runs with the following settings, which the wizard always generates:
+The agent containers run with the following settings, which the wizard always generates.
+The example shows a host with a file worker and a PostgreSQL worker.
 
 ```yaml
+x-lbackup-hardening: &hardening
+  restart: unless-stopped
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  tmpfs:
+    - /tmp:size=256m,noexec,nosuid,nodev
+
 services:
-  lbackup-agent:
+  lbackup-manager:
+    <<: *hardening
     image: ghcr.io/<owner>/lbackup-agent:<version>
-    restart: unless-stopped
-    read_only: true
+    command: ["manager"]
+    user: "10001:10001"
+    mem_limit: 256m
+    volumes:
+      - lbackup-agent-state:/state
+      - lbackup-agent-socket:/socket
+    environment:
+      LBACKUP_SERVER: https://10.8.0.1:8443
+      LBACKUP_SERVER_FINGERPRINT: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      LBACKUP_ENROLL_TOKEN: replace-with-token-from-wizard
+
+  lbackup-worker-files:
+    <<: *hardening
+    image: ghcr.io/<owner>/lbackup-agent:<version>
+    command: ["worker", "--name", "files"]
     user: "0:0"
-    cap_drop:
-      - ALL
     cap_add:
       - DAC_READ_SEARCH
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 256
     mem_limit: 1g
-    tmpfs:
-      - /tmp:size=256m,noexec,nosuid,nodev
     volumes:
       - type: bind
         source: /
@@ -145,25 +204,44 @@ services:
         bind:
           propagation: rprivate
           recursive: disabled
-      - lbackup-agent-state:/state
-    environment:
-      LBACKUP_SERVER: https://nas.example.org:8443
-      LBACKUP_SERVER_FINGERPRINT: sha256:0000000000000000000000000000000000000000000000000000000000000000
-      LBACKUP_ENROLL_TOKEN: replace-with-token-from-wizard
+      - lbackup-agent-socket:/socket:ro
+
+  lbackup-worker-postgres:
+    <<: *hardening
+    image: ghcr.io/<owner>/lbackup-agent:<version>-postgres
+    command: ["worker", "--name", "postgres"]
+    user: "10001:10001"
+    mem_limit: 1g
+    networks:
+      - default
+      - app-db
+    volumes:
+      - lbackup-agent-socket:/socket:ro
+
+networks:
+  app-db:
+    external: true
 
 volumes:
   lbackup-agent-state:
+  lbackup-agent-socket:
 ```
 
-`DAC_READ_SEARCH` is the only capability, because it lets the agent read every file regardless of permissions and nothing else.
+The management agent and the database workers run as an unprivileged user without any capability and without a host mount,
+because they neither read host files nor need privileges to talk to the server or a database.
+The socket volume is mounted read-only into the workers,
+because connecting to a Unix socket works on a read-only mount and the workers never need to write there.
+
+`DAC_READ_SEARCH` is the only capability of the file worker, because it lets the agent read every file regardless of permissions and nothing else.
 `DAC_OVERRIDE` is not added, because it also grants write access, which a backup agent never needs.
-The process runs as UID 0 inside the container, because file capabilities on a non-root binary are blocked by `no-new-privileges`.
+The file worker runs as UID 0 inside the container, because file capabilities on a non-root binary are blocked by `no-new-privileges`.
 User namespace remapping is not used for the agent, because capabilities inside a remapped namespace do not apply to host-owned files.
 
 The root filesystem is mounted non-recursively with `recursive: disabled`, which Docker supports since version 25.
 Submounts such as `/proc`, `/sys`, `/dev`, `/run`, container overlay mounts and the Docker socket therefore never appear in the container.
 Masking them with empty `tmpfs` mounts was rejected, because a missed submount would silently stay visible.
-Data that lives on separate filesystems, such as a dedicated `/home` or `/var/lib/postgresql` partition, is added as explicit additional read-only bind mounts.
+Data that lives on separate filesystems, such as a dedicated `/home` or `/var/lib/postgresql` partition,
+is added as explicit additional read-only bind mounts.
 The wizard offers a `findmnt` command whose output can be pasted back, so it can propose these mounts instead of the user listing them by hand.
 If a mount must be recursive, the wizard uses `recursive: readonly`,
 because a plain `read_only` flag on a recursive bind does not make the submounts read-only.
@@ -174,11 +252,92 @@ Reading them would waste space and produce inconsistent copies of runtime state.
 
 Database dumps need no additional capability, because the agent connects to the database over the network like any client.
 Unix sockets of databases live under `/run` and are therefore hidden.
-When a database only listens on a socket, the wizard adds a read-only bind mount of exactly that socket directory.
+When a database only listens on a socket, the wizard adds a read-only bind mount of exactly that socket directory to the database worker.
 Connecting to a socket on a read-only mount works, because the read-only flag does not apply to socket inodes.
 
 The Docker socket is never mounted.
 It would grant full root on the host, which contradicts the purpose of the minimal capability set.
+
+## Native agent
+
+The agent also runs as a native binary under systemd, for hosts without Docker such as small VPS instances or LXC containers.
+Configuration, protocol, modes and enrollment are identical to the container agent,
+because the native agent is the same binary and only the confinement differs.
+
+### Installation
+
+The wizard offers an install command as an alternative to the `docker run` command.
+
+```bash
+curl -fsSk --pinnedpubkey 'sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' \
+  https://10.8.0.1:8443/install.sh | sudo sh -s -- --token replace-with-token-from-wizard
+```
+
+The script is served by the agent listener, so a host that can enroll can also install without reaching GitHub.
+`--pinnedpubkey` pins the server key, so the script cannot be replaced in transit even with the self-signed CA,
+and `-k` only skips the CA check that the pin replaces.
+The script detects `x86_64` or `aarch64`, downloads the matching binary over the same pinned connection,
+verifies its SHA-256 checksum against the value served by the server and installs the systemd unit.
+Running the same command again updates the agent in place and keeps its state,
+so the update command shown in the UI is this command without a token.
+
+### Confinement
+
+The installer generates the following unit:
+
+```ini
+[Unit]
+Description=LBackup agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/lbackup-agent
+User=lbackup
+Group=lbackup
+StateDirectory=lbackup-agent
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+MemoryMax=1G
+TasksMax=256
+Nice=10
+IOSchedulingClass=idle
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The agent runs as the dedicated user `lbackup` with `CAP_DAC_READ_SEARCH` as an ambient capability,
+which gives the same read access as the container agent without running as root.
+Ambient capabilities survive `NoNewPrivileges`, because they do not depend on file capabilities or setuid.
+`ProtectSystem=strict` makes the whole filesystem read-only for the service except its `StateDirectory`,
+which replaces the read-only bind mount of the container variant.
+A plain root service was rejected, because a compromised agent would then own the host.
+
+The native agent sees `/proc`, `/sys`, `/dev`, `/run` and every other mount, because no mount namespace hides them.
+It therefore skips pseudo filesystems by filesystem type, such as `proc`, `sysfs`, `devtmpfs`, `tmpfs`, `cgroup2` and `overlay`,
+in addition to the default exclude list.
+Matching by type was chosen over a path list, because a path list misses submounts in the same way the rejected `tmpfs` masking does.
+
+Database dumps use the client tools installed on the host,
+because the native agent has no image that could ship them.
+The agent reports the client versions to the server,
+so the UI can warn when a `pg_dump` is older than the PostgreSQL server it targets.
+
+A native restore runs the same binary as a one-shot process with a restore token, started by the administrator with `sudo`.
+It receives the write capabilities listed in the restore section only for that process,
+so the permanent service never holds them.
 
 ## Backup targets
 
@@ -211,17 +370,54 @@ because a file copy of a running database is not consistent and the database tar
 Dumps are streamed directly into `rustic_core` as a stdin-style source, so no temporary dump file is written.
 This matters because the agent filesystem is read-only and a dump can be larger than the available `tmpfs`.
 
+The client tools ship in image variants per database family.
+
+| Image tag | Contents |
+| --- | --- |
+| `lbackup-agent:<version>` | Agent only, enough for files, Docker volumes and SQLite |
+| `lbackup-agent:<version>-postgres` | `pg_dump` and `pg_dumpall` of every supported PostgreSQL major version |
+| `lbackup-agent:<version>-mariadb` | `mariadb-dump`, also used for MySQL |
+| `lbackup-agent:<version>-mongodb` | `mongodump` |
+| `lbackup-agent:<version>-redis` | `redis-cli` |
+| `lbackup-agent:<version>-full` | All clients |
+
+The wizard assigns each target to a worker with the smallest variant that covers it,
+and regenerates the compose file when a new target needs a worker that does not exist yet.
+Variants were chosen over one large image, because most hosts run one database family and would otherwise pull several hundred MB of unused clients.
+The `-full` variant exists for hosts where one worker for all databases is preferred over several containers.
+Downloading clients at runtime was rejected, because it needs a writable cache and network access beyond the server.
+
+A database target connects in one of three ways, chosen per target in the wizard.
+
+| Connection | How the agent reaches the database | Trade-off |
+| --- | --- | --- |
+| Docker network | The database worker joins the internal network of the database | Isolated, but adding a network recreates the worker container |
+| Host network | The database worker uses `network_mode: host` and the database publishes a port on `127.0.0.1` | Changes need no new worker container, but every database compose file publishes a port |
+| Direct address | The agent connects to any `host:port` reachable from its network, such as a published host port, another machine or a managed database | Needs no change on the agent, but the port must be reachable from the agent network |
+
+All three are offered, because the right choice depends on how the existing services are deployed and none fits every host.
+For a direct address on the same host in bridge mode the wizard adds `extra_hosts: host.docker.internal:host-gateway`,
+because ports published only on `127.0.0.1` are not reachable from a bridge network and the wizard warns about that case.
+The native agent always uses the host network, so only the host network and direct address connections apply to it.
+
 | Database | Method | Notes |
 | --- | --- | --- |
 | PostgreSQL | `pg_dump` per database in custom format, `pg_dumpall --globals-only` for roles | Client version must be at least the server version, so the image ships several major versions |
 | MariaDB and MySQL | `mariadb-dump --single-transaction` | Consistent for InnoDB without locking |
 | MongoDB | `mongodump --archive` | Replica set oplog option for point-in-time consistency |
 | Redis and Valkey | Fetch the RDB via `redis-cli --rdb` | No access to the Redis data directory needed |
-| SQLite | Online backup API from the agent | The file is read through the read-only mount, the open point on WAL files applies |
+| SQLite | Copy of database, `-wal` and `-shm` files, then integrity check | Works on the read-only mount, see below |
 
 Database credentials are stored encrypted on the server and sent to the agent only for the duration of a job.
 Alternatively a target can reference a credentials file on the host, such as a `.pgpass` or an `.env` file, which the agent reads through the read-only mount.
 The UI recommends a dedicated read-only database user and shows the SQL to create one, because the agent never needs write access to a database.
+
+SQLite databases are copied together with their `-wal` and `-shm` files in one pass,
+because the online backup API needs to create these files and fails on the read-only mount.
+The agent checks that all three files have the same modification state before and after the copy,
+opens the copy in memory with `PRAGMA integrity_check` and repeats the copy up to three times when the check fails.
+`immutable=1` was rejected, because it silently produces an inconsistent copy during writes,
+and an export through a custom command remains available for applications that provide one.
 
 Each database target can verify its dump after the upload,
 for example by running `pg_restore --list` against the stream, so that a truncated dump is detected immediately and not on the day of a restore.
@@ -231,7 +427,7 @@ for example by running `pg_restore --list` against the stream, so that a truncat
 A target can run a command whose standard output is backed up, for example an application-specific export.
 Commands are defined only on the server and the agent executes nothing that is not part of its signed configuration,
 because an arbitrary command channel would turn the backup system into a remote shell.
-Commands run inside the agent container with the same restrictions, so they cannot write to the host.
+Commands run inside the worker the target is assigned to and with its restrictions, so they cannot write to the host.
 
 ## Scheduling and execution
 
@@ -253,6 +449,26 @@ Retention, prune and verification run on the server directly on the repository f
 - Cleanup of stale locks left by crashed agents
 - Storage quota per agent, because an `append-only` agent could otherwise fill the NAS
 - Repository statistics such as size, deduplication ratio and growth over time
+
+### Off-site copy
+
+The server copies repositories to off-site backends on a schedule, which fulfills G7.
+The copy runs on the NAS and not on the agents, because agents in `append-only` mode must not hold credentials for a second location.
+
+Supported backends are S3-compatible storage, SFTP and every backend of `rclone`,
+which `rustic_core` already provides, so no backend code has to be written for the first version.
+A second restic REST server was not included, because `rclone` covers it with its `restic` remote type.
+
+Each off-site target chooses one of two modes.
+
+| Mode | Behavior | Trade-off |
+| --- | --- | --- |
+| Mirror | Copies the encrypted pack files 1:1 after each prune, same key as the NAS repository | Cheap and fast, but the off-site copy has the same retention and the same key |
+| Re-encrypted copy | `rustic copy` into a separate repository with its own password and its own retention policy | A leaked NAS key does not open the off-site copy, but every snapshot is decrypted and encrypted again on the NAS |
+
+Both modes are offered, because the choice weighs NAS CPU and provider traffic against key separation and differs per installation.
+Off-site credentials and the passwords of re-encrypted repositories are stored encrypted like repository passwords and are part of the recovery kit.
+Off-site repositories stay in the restic format, so G6 also holds for them.
 
 ## Restore and rollback
 
@@ -309,15 +525,27 @@ Every feature needs an automated test before it counts as done, as required by G
 - Fault injection for network loss during upload, server restart, agent kill, full disk on the NAS and expired certificates
 - Compatibility tests that open repositories with the upstream `restic` and `rustic` CLIs, which verifies G6
 - VM tests with QEMU and a real distribution image, because a host-root bind mount and separate partitions cannot be reproduced faithfully inside nested containers
+- Isolation tests that assert a database worker sees no host files, a file worker joins no database network,
+  and the management agent rejects worker names missing from its configuration
+- VM tests of the native agent that assert it cannot write outside its state directory and skips pseudo filesystems
+- Off-site tests against MinIO, an SFTP container and an `rclone` local remote, including a restore from the off-site copy alone
+- Every integration and VM test runs on `x86_64` and `aarch64`
+
+## License
+
+LBackup is published under the AGPL-3.0,
+because the server is a network service and the AGPL keeps modified hosted versions open where the GPL would not.
+The license is compatible with `rustic_core`, which is dual licensed under Apache-2.0 and MIT.
 
 ## Milestones
 
 1. Workspace, protocol crate, server with SQLite, UI skeleton, enrollment with mutual TLS, file targets in `append-only` mode
-2. Scheduling, retention, prune, check, notifications, PostgreSQL and MariaDB targets
+2. Management and worker agents, scheduling, retention, prune, check, notifications, PostgreSQL and MariaDB targets
 3. Snapshot browser, download, one-shot restore agent, database rollback
 4. MongoDB, Redis, SQLite, configuration presets, Docker volumes, custom commands
-5. Roles, TOTP, OIDC, audit log, metrics, configuration export, recovery kit
-6. Hardening review, VM test suite, documentation, first release
+5. Roles, TOTP, OIDC, audit log, metrics, configuration export, recovery kit, off-site copy
+6. Native agent with install script and systemd unit
+7. Hardening review, VM test suite on `x86_64` and `aarch64`, documentation, first release
 
 The order puts the safety-critical path of enrollment and `append-only` writes first,
 because every later feature builds on its guarantees.
@@ -338,8 +566,13 @@ G2 requires the VPS hosts to reach the NAS, which usually sits behind a home rou
 
 #### Approach
 
-Not decided.
-The server design is independent of it, because the agent only needs a reachable URL.
+A VPN with WireGuard or Tailscale between the VPS hosts and the NAS.
+The agent listener binds to the VPN interface, and the wizard uses the VPN address of the NAS as server URL.
+Port forwarding was rejected, because it exposes the agent listener to the internet and needs a dynamic DNS name for a changing home address.
+A relay was rejected, because it is one more component to build, secure and operate.
+The server design stays independent of the choice, because the agent only needs a reachable URL.
+The container agent reaches the VPN through the routing of the host,
+so the documentation recommends the VPN IP address over names like Tailscale MagicDNS, which containers do not resolve by default.
 
 ### NAS platform
 
@@ -355,7 +588,7 @@ Synology, TrueNAS and Unraid differ in Docker version and filesystem features.
 
 #### Approach
 
-Not decided, depends on the NAS in use.
+A generic Docker Engine 24 or newer, as defined in the architecture overview.
 
 ### Repository key held by the agent
 
@@ -387,7 +620,8 @@ Accept for the first version and revisit after milestone 6.
 
 #### Approach
 
-Not decided.
+Image variants per database family, as defined in the database section.
+The native agent uses the clients installed on the host.
 
 ### Reaching databases in Docker networks
 
@@ -400,10 +634,11 @@ The agent must join those networks, which is fixed at container creation and can
 
 - Wizard lists required networks and regenerates the compose file
 - Agent uses `network_mode: host` and databases publish a port on `127.0.0.1`
+- Agent connects to a direct `host:port` address
 
 #### Approach
 
-Not decided.
+All three, chosen per target, as defined in the database section.
 
 ### SQLite with WAL on a read-only mount
 
@@ -419,7 +654,7 @@ The SQLite backup API needs to read the `-wal` and `-shm` files and may try to c
 
 #### Approach
 
-Not decided.
+Copy all three files together and check integrity afterwards, as defined in the database section.
 
 ### Agent updates
 
@@ -435,3 +670,22 @@ Agents must stay compatible with the server, and updating them requires access t
 #### Approach
 
 Both, with the server rejecting agents outside the supported range.
+Native agents update with the install command, which the UI shows without a token.
+
+### Protection of the off-site copy against a compromised server
+
+#### Problem
+
+The server holds the off-site credentials, so a compromised NAS can delete the off-site copy as well,
+which weakens G7 against ransomware.
+
+#### Options
+
+- S3 object lock or bucket versioning with a retention period, so deleted objects stay recoverable
+- Credentials without delete permission, with deletion done manually or by a separate process
+- Delayed deletion in mirror mode, which removes pruned packs off-site only after a configurable period
+- Accept the risk for the first version
+
+#### Approach
+
+Not decided.
