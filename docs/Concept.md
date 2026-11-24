@@ -25,8 +25,8 @@ It is the starting point for all further specification documents and lists the d
 | Component | Runs on | Responsibility |
 | --- | --- | --- |
 | Server | NAS, Docker | Repository storage, configuration, scheduling, web UI, retention, restore orchestration |
-| Management agent | VPS, Docker or native systemd service, one per host | Holds the server connection and identity, receives configuration, schedules jobs and relays them to its workers |
-| Worker agent | VPS, Docker, one per image variant | Reads host data or creates dumps for its assigned targets, deduplicates, encrypts and uploads snapshots |
+| Worker agent | VPS, Docker or native systemd service | Reads host data or creates dumps for its assigned targets, deduplicates, encrypts and uploads snapshots, and includes the management role unless it opts out |
+| Management agent | VPS, Docker, optional, at most one per host | Holds the server connection and identity, receives configuration, schedules jobs and relays them to the workers of a host with more than one worker |
 | Restore agent | VPS, Docker or native binary, one-shot | Writes a selected snapshot back to the host, started only on demand |
 | Web UI | Embedded in the server binary | Administration, agent enrollment wizard, browsing and restore |
 
@@ -36,7 +36,8 @@ because a single artifact without a separate web server keeps deployment and ver
 The server keeps its own state in SQLite via `sqlx`, because the NAS hosts one instance and an external database would add an operational dependency without benefit.
 
 The agent is a separate Rust binary that embeds `rustic_core` as a library.
-It runs either as management agent or as worker agent, which the section on management and worker agents defines.
+It runs as worker with embedded management, as worker only or as dedicated management agent,
+which the section on management and worker agents defines.
 Deduplication, compression and encryption happen on the agent,
 because only changed and already encrypted chunks then cross the network and the NAS never sees plaintext in transit.
 
@@ -102,7 +103,6 @@ Agents can be revoked in the UI, which closes the connection and rejects the cer
 
 ### Management and worker agents
 
-A host runs exactly one management agent and one or more worker agents.
 Each target is assigned to a worker whose image covers it,
 so a file backup runs in the plain agent image while a PostgreSQL dump runs in the `-postgres` variant.
 Separate workers were chosen over one container with every client,
@@ -110,8 +110,25 @@ because each worker then gets only the mounts and networks its targets need.
 The file worker holds the read-only host root mount but joins no database network,
 and a database worker joins the database network but never sees the host filesystem.
 
-Only the management agent enrolls, holds the client certificate and connects to the server.
-Workers connect to the management agent over a Unix socket in a shared volume,
+Management is the role that enrolls, holds the client certificate and the cached configuration in the state volume,
+connects to the server and schedules the jobs of the host.
+Every worker includes the management role and enables it by default, and it is disabled with `--no-management`.
+A host has exactly one active management role, which lives in one of two places.
+
+| Topology | Containers | Management |
+| --- | --- | --- |
+| Single worker | One worker | Embedded in the worker |
+| Single worker with dedicated management | One worker with `--no-management` and one management agent | Dedicated management agent |
+| Several workers | Every worker with `--no-management` and one management agent | Dedicated management agent |
+
+A host with one worker therefore runs a single container,
+because a separate management container would add a service without any benefit for the common case.
+The dedicated management agent is only required once a host has more than one worker,
+because one identity must then serve several containers and none of the workers should become the hub for the others.
+An embedded management role serves only its own worker and never accepts other workers,
+so the privileged file worker never relays the traffic of database workers.
+
+With a dedicated management agent, workers connect to it over a Unix socket in a shared volume,
 and the management agent relays control messages and bulk data to the server.
 This keeps one identity, one repository and one configuration view per host,
 so the UI shows a host as one agent regardless of how many workers it runs.
@@ -124,8 +141,34 @@ It accepts only the worker names listed in its configuration and reports a missi
 Every worker of a host writes into the same repository with its key,
 so the limitation on the repository key held by the agent applies per host and not per worker.
 
-The native agent runs management and all targets in one process,
+The native agent always runs with embedded management and all targets in one process,
 because without containers there are no separate images and mounts to split.
+
+### Topology migration
+
+The identity of a host is the state volume and not the container that mounts it.
+A change of topology therefore moves the state volume from one container to another,
+so the host keeps its certificate, repository and history and never enrolls again.
+
+When a target needs a worker that does not exist yet, the UI starts a migration guide instead of only showing a new command.
+
+1. The guide shows the new `compose.yaml` and a diff against the current one.
+2. The existing worker gets `--no-management` and loses its state volume.
+3. A dedicated management agent is added and mounts the same state volume the worker used for management, together with a new socket volume.
+4. The new worker is added and connects to the socket volume.
+5. The administrator runs `docker compose up -d` on the host.
+6. The guide waits until the management agent connects with the existing certificate and every expected worker reports in,
+   and shows each step as done only after the server has observed it.
+
+The reverse migration is offered when a host drops to one worker.
+The guide asks whether to keep the dedicated management agent or to merge management back into the remaining worker.
+Keeping it is offered, because it avoids touching a working setup and makes a later second worker a one-line change.
+Merging moves the state volume back to the remaining worker and removes `--no-management` and the socket volume.
+
+The state volume must never be active in two management roles at once,
+because two connections with one certificate would issue conflicting jobs.
+The management role holds a lock file in the state volume, and the server accepts only one connection per certificate,
+so a half-applied migration fails with a clear error in the UI instead of running two managers.
 
 ### Dynamic configuration
 
@@ -159,7 +202,47 @@ The open points list an asymmetric alternative.
 ## Container hardening of the agent
 
 The agent containers run with the following settings, which the wizard always generates.
-The example shows a host with a file worker and a PostgreSQL worker.
+A host with a single worker runs one container with embedded management.
+
+```yaml
+services:
+  lbackup-agent:
+    image: ghcr.io/<owner>/lbackup-agent:<version>
+    command: ["worker", "--name", "files"]
+    restart: unless-stopped
+    read_only: true
+    user: "0:0"
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    tmpfs:
+      - /tmp:size=256m,noexec,nosuid,nodev
+    volumes:
+      - type: bind
+        source: /
+        target: /host
+        read_only: true
+        bind:
+          propagation: rprivate
+          recursive: disabled
+      - lbackup-agent-state:/state
+    environment:
+      LBACKUP_SERVER: https://10.8.0.1:8443
+      LBACKUP_SERVER_FINGERPRINT: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      LBACKUP_ENROLL_TOKEN: replace-with-token-from-wizard
+
+volumes:
+  lbackup-agent-state:
+```
+
+After the migration to a second worker, the same host runs a dedicated management agent,
+the file worker without management and a PostgreSQL worker.
+The state volume `lbackup-agent-state` moves from the worker to the management agent unchanged.
 
 ```yaml
 x-lbackup-hardening: &hardening
@@ -191,7 +274,7 @@ services:
   lbackup-worker-files:
     <<: *hardening
     image: ghcr.io/<owner>/lbackup-agent:<version>
-    command: ["worker", "--name", "files"]
+    command: ["worker", "--name", "files", "--no-management"]
     user: "0:0"
     cap_add:
       - DAC_READ_SEARCH
@@ -209,7 +292,7 @@ services:
   lbackup-worker-postgres:
     <<: *hardening
     image: ghcr.io/<owner>/lbackup-agent:<version>-postgres
-    command: ["worker", "--name", "postgres"]
+    command: ["worker", "--name", "postgres", "--no-management"]
     user: "10001:10001"
     mem_limit: 1g
     networks:
@@ -227,7 +310,7 @@ volumes:
   lbackup-agent-socket:
 ```
 
-The management agent and the database workers run as an unprivileged user without any capability and without a host mount,
+The dedicated management agent and the database workers run as an unprivileged user without any capability and without a host mount,
 because they neither read host files nor need privileges to talk to the server or a database.
 The socket volume is mounted read-only into the workers,
 because connecting to a Unix socket works on a read-only mount and the workers never need to write there.
@@ -527,6 +610,8 @@ Every feature needs an automated test before it counts as done, as required by G
 - VM tests with QEMU and a real distribution image, because a host-root bind mount and separate partitions cannot be reproduced faithfully inside nested containers
 - Isolation tests that assert a database worker sees no host files, a file worker joins no database network,
   and the management agent rejects worker names missing from its configuration
+- Migration tests from one to two workers and back, with and without keeping the management agent,
+  that assert the host keeps its certificate and repository and that two management roles on one state volume are rejected
 - VM tests of the native agent that assert it cannot write outside its state directory and skips pseudo filesystems
 - Off-site tests against MinIO, an SFTP container and an `rclone` local remote, including a restore from the off-site copy alone
 - Every integration and VM test runs on `x86_64` and `aarch64`
