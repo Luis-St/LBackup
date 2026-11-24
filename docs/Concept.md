@@ -1,63 +1,97 @@
 # LBackup Concept
 
 This document defines the features and the architecture of LBackup,
-a backup system that moves data from VPS hosts into repositories on a NAS.
-It is the starting point for all further specification documents and lists the decisions still open at the end.
+a self-hosted backup system that moves data from Linux hosts into encrypted repositories on a central server.
+It is the starting point for all further specification documents and records the decisions on the open points at the end.
 
 ## Goals
 
-- G1 Back up files, configurations and databases of several VPS hosts into a central repository on the NAS.
+- G1 Back up files, configurations and databases of any number of Linux hosts into repositories on one central server.
+  The server is not bound to a type of machine,
+  because a NAS, a home server, a rented server and a VM in a company network all fill the same role.
 - G2 The only network requirement is that an agent can reach the server.
-  The server never connects to an agent, because VPS hosts behind NAT or firewalls must work without inbound ports.
+  The server never connects to an agent, because hosts behind NAT or firewalls must work without inbound ports.
 - G3 Everything is configured on the server and pushed to the agents at runtime.
-  A configuration change must never require logging into a VPS, because that is the main maintenance cost of per-host tools.
-- G4 A compromised VPS must not be able to destroy or read the backups of other hosts,
+  A configuration change must never require logging into an agent host, because that is the main maintenance cost of per-host tools.
+- G4 A compromised agent host must not be able to destroy or read the backups of other hosts,
   and by default not its own backup history either.
 - G5 The system is safe for production use.
   Every feature ships with an automated test in a local VM or container setup before it is considered usable.
 - G6 Backups remain restorable without LBackup.
   Repositories use the restic format, so plain `rustic` or `restic` can open them if the server is lost.
 - G7 Backups follow the 3-2-1 rule without a second tool.
-  The server copies repositories to an off-site backend, because a NAS in one building is a single point of failure for fire, theft and ransomware.
+  The server copies repositories to an off-site backend, because a single storage location is a single point of failure for fire, theft, hardware failure and ransomware.
+
+## Use cases
+
+LBackup is one general system, and the following deployments are examples of it and not separate modes.
+All of them use the same server, agents and repository format,
+because a special case in the design would have to be tested and maintained separately.
+
+| Use case | Server | Agents | Off-site backend |
+| --- | --- | --- | --- |
+| Rented servers to a home NAS | NAS behind a home router | VPS hosts that reach the NAS through a VPN | S3-compatible storage |
+| Homelab | Home server with a disk array | Other machines and VMs in the same LAN and the server host itself | A second machine at another location over SFTP |
+| Small company | VM or dedicated server in the company network | Application and database servers in the same network or in a cloud | S3-compatible storage with object lock |
+| Public backup server | Rented server with a public address | Hosts anywhere on the internet that connect directly | Storage of a second provider |
+| Single machine | The host itself | One agent on the same host that connects to `localhost` | S3-compatible storage |
+
+A single machine fulfills G7 only together with an off-site backend,
+because its local repository shares the hardware with the data it protects.
+An agent on the server host itself is an ordinary agent with its own repository,
+because a special local path would bypass the mode enforcement of the repository API.
+
+Agents run on Linux only.
+Windows and macOS are not supported,
+because the confinement through capabilities, read-only mounts and systemd sandboxing has no equivalent there and would need a separate security design.
 
 ## Architecture overview
 
 | Component | Runs on | Responsibility |
 | --- | --- | --- |
-| Server | NAS, Docker | Repository storage, configuration, scheduling, web UI, retention, restore orchestration |
-| Worker agent | VPS, Docker or native systemd service | Reads host data or creates dumps for its assigned targets, deduplicates, encrypts and uploads snapshots, and includes the management role unless it opts out |
-| Management agent | VPS, Docker, optional, at most one per host | Holds the server connection and identity, receives configuration, schedules jobs and relays them to the workers of a host with more than one worker |
-| Restore agent | VPS, Docker or native binary, one-shot | Writes a selected snapshot back to the host, started only on demand |
+| Server | Any Linux host, Docker | Repository storage, configuration, scheduling, web UI, retention, restore orchestration |
+| Worker agent | Linux host, Docker or native systemd service | Reads host data or creates dumps for its assigned targets, deduplicates, encrypts and uploads snapshots, and includes the management role unless it opts out |
+| Management agent | Linux host, Docker, optional, at most one per host | Holds the server connection and identity, receives configuration, schedules jobs and relays them to the workers of a host with more than one worker |
+| Restore agent | Linux host, Docker or native binary, one-shot | Writes a selected snapshot back to the host, started only on demand |
 | Web UI | Embedded in the server binary | Administration, agent enrollment wizard, browsing and restore |
 
 The server is a single Rust binary based on `tokio` and `axum`.
 The web UI is written in SvelteKit with `adapter-static` and embedded into the binary with `rust-embed`,
 because a single artifact without a separate web server keeps deployment and versioning simple.
-The server keeps its own state in SQLite via `sqlx`, because the NAS hosts one instance and an external database would add an operational dependency without benefit.
+The server keeps its own state in SQLite via `sqlx`, because one installation runs exactly one server instance and an external database would add an operational dependency without benefit.
 
 The agent is a separate Rust binary that embeds `rustic_core` as a library.
 It runs as worker with embedded management, as worker only or as dedicated management agent,
 which the section on management and worker agents defines.
 Deduplication, compression and encryption happen on the agent,
-because only changed and already encrypted chunks then cross the network and the NAS never sees plaintext in transit.
+because only changed and already encrypted chunks then cross the network and the server never handles plaintext during a backup.
 
 Both binaries live in one Cargo workspace with a shared `protocol` crate,
 so that server and agent cannot drift apart in their message definitions.
 
 Server and agent are built for `x86_64` and `aarch64`, as static `musl` binaries and as multi-arch images for `linux/amd64` and `linux/arm64`.
-Both architectures are required, because ARM VPS offers and ARM based NAS devices are common and a missing architecture would exclude them entirely.
+Both architectures are required, because ARM VPS offers, ARM based NAS devices and single-board computers are common and a missing architecture would exclude them entirely.
 
-The server only requires a generic Docker Engine 24 or newer with Compose v2, independent of the NAS vendor.
-Targeting Synology, TrueNAS or Unraid specifically was rejected,
+The server only requires a generic Docker Engine 24 or newer with Compose v2, independent of the machine it runs on.
+Targeting a NAS platform such as Synology, TrueNAS or Unraid specifically was rejected,
 because vendor features such as ZFS snapshots are not needed by the design and would bind the project to one platform.
-Version 24 is the minimum because it is the oldest version still shipped by the current NAS platforms.
+Version 24 is the minimum because it is the oldest version still shipped by the current NAS platforms,
+which lag behind general Linux distributions and are therefore the most restrictive environment the server runs in.
 The agent hosts need Docker 25, which the container hardening section explains.
 
 ## Repository layout
 
-Each agent gets its own rustic repository on the NAS, for example `/data/repos/<agent-id>/`.
+Each agent gets its own rustic repository below the storage directory of the server, for example `/data/repos/<agent-id>/`.
 A shared repository would deduplicate across hosts, but a single repository key would then give every agent access to every host's data, which contradicts G4.
 Targets of one agent are separated inside the repository by snapshot tags and paths.
+
+The storage directory is a local path inside the server container, and what backs it is the choice of the installation,
+such as a local disk, the disk array of a NAS or an NFS or SMB share mounted on the host.
+A network share must support atomic renames,
+because the repository API writes every file under a temporary name first, so an interrupted upload never leaves a partial file under its final name.
+Remote object storage as primary storage was rejected,
+because prune, check and the snapshot browser would then read every pack over the network,
+and object storage is already supported as off-site backend.
 
 Repository passwords are generated by the server and stored encrypted in the server database.
 The server needs them for retention, verification, browsing and restores.
@@ -73,7 +107,7 @@ A WebSocket was chosen over gRPC because it passes through reverse proxies and t
 Bulk data uses separate HTTPS requests, so that a large upload never blocks control messages.
 
 The server exposes two listeners.
-The agent listener is the only port that needs to be reachable from the VPS hosts.
+The agent listener is the only port that needs to be reachable from the agent hosts.
 The UI listener can stay restricted to the LAN or a VPN,
 because exposing the administration interface to the internet is not required by any agent function.
 
@@ -190,14 +224,14 @@ Enforcement on the server side is required, because a compromised agent can igno
 | `read-only` | no | no | yes | Verification or migration hosts |
 | `restore` | no | no | yes, limited to one snapshot | One-shot restore agent |
 
-`append-only` is the default, because a compromised VPS then cannot delete or rewrite its backup history.
-Deletion of data only happens on the server through retention and prune, which run locally on the NAS.
+`append-only` is the default, because a compromised agent host then cannot delete or rewrite its backup history.
+Deletion of data only happens on the server through retention and prune, which run locally on the server.
 No mode grants an agent the right to forget snapshots or to prune,
 because those operations are the main lever of ransomware against backups.
 
 A limitation remains that an `append-only` agent holds its repository key and could therefore decrypt its own history.
-This is accepted for the first version, because the data originates from that host anyway.
-The open points list an asymmetric alternative.
+This is accepted, because the data originates from that host and an attacker on it can read the current state directly.
+The open point on the repository key held by the agent records the rejected alternatives and the mitigation for data the host has since deleted.
 
 ## Container hardening of the agent
 
@@ -519,10 +553,10 @@ Commands run inside the worker the target is assigned to and with its restrictio
 ## Scheduling and execution
 
 - Cron expressions per target with a time zone, plus manual triggers from the UI
-- Random start jitter per agent, so that many hosts do not hit the NAS at the same minute
+- Random start jitter per agent, so that many hosts do not hit the server at the same minute
 - Concurrency limits per agent and globally on the server
 - Retry with backoff when the server is unreachable, and a missed-run policy that runs once after an outage instead of catching up every slot
-- Bandwidth limit per agent and time window, because VPS traffic is often metered
+- Bandwidth limit per agent and time window, because the traffic of rented servers is often metered
 - CPU and IO niceness of the agent process, which needs no capability because it only lowers priority
 - Live progress and logs streamed to the UI
 
@@ -534,28 +568,64 @@ Retention, prune and verification run on the server directly on the repository f
 - Scheduled prune with a configurable maximum of unused data
 - Scheduled `check`, with a configurable percentage of pack data read per run, so that the whole repository is verified over a rotation period
 - Cleanup of stale locks left by crashed agents
-- Storage quota per agent, because an `append-only` agent could otherwise fill the NAS
+- Storage quota per agent, because an `append-only` agent could otherwise fill the server storage
 - Repository statistics such as size, deduplication ratio and growth over time
 
 ### Off-site copy
 
 The server copies repositories to off-site backends on a schedule, which fulfills G7.
-The copy runs on the NAS and not on the agents, because agents in `append-only` mode must not hold credentials for a second location.
+The copy runs on the server and not on the agents, because agents in `append-only` mode must not hold credentials for a second location.
 
 Supported backends are S3-compatible storage, SFTP and every backend of `rclone`,
-which `rustic_core` already provides, so no backend code has to be written for the first version.
+which `rustic_core` already provides, so no storage backend code has to be written.
 A second restic REST server was not included, because `rclone` covers it with its `restic` remote type.
 
 Each off-site target chooses one of two modes.
 
 | Mode | Behavior | Trade-off |
 | --- | --- | --- |
-| Mirror | Copies the encrypted pack files 1:1 after each prune, same key as the NAS repository | Cheap and fast, but the off-site copy has the same retention and the same key |
-| Re-encrypted copy | `rustic copy` into a separate repository with its own password and its own retention policy | A leaked NAS key does not open the off-site copy, but every snapshot is decrypted and encrypted again on the NAS |
+| Mirror | Copies the encrypted pack files 1:1 after each prune, same key as the primary repository | Cheap and fast, but the off-site copy has the same retention and the same key |
+| Re-encrypted copy | `rustic copy` into a separate repository with its own password and its own retention policy | A leaked key of the primary repository does not open the off-site copy, but every snapshot is decrypted and encrypted again on the server |
 
-Both modes are offered, because the choice weighs NAS CPU and provider traffic against key separation and differs per installation.
+Both modes are offered, because the choice weighs server CPU and provider traffic against key separation and differs per installation.
 Off-site credentials and the passwords of re-encrypted repositories are stored encrypted like repository passwords and are part of the recovery kit.
 Off-site repositories stay in the restic format, so G6 also holds for them.
+
+### Protection against a compromised server
+
+The server holds the off-site credentials, so a compromised server could delete the off-site copy as well.
+The protection against that case is enforced by the backend,
+because any rule the server enforces itself disappears together with the server.
+Each off-site target declares one of the following protection levels.
+
+| Protection | Backend | Mechanism |
+| --- | --- | --- |
+| `object-lock` | S3-compatible storage with object lock | Every uploaded object gets a retention period in compliance mode, so neither the server nor the account owner can delete it earlier |
+| `versioning` | S3-compatible storage with versioning and credentials without the right to delete object versions | A deletion only hides the current version, and a lifecycle rule of the bucket removes old versions after the protection period |
+| `append-only-remote` | A restic REST server in `--append-only` mode, reached through the `restic` remote of `rclone` | The remote side rejects every deletion, and pruning happens there by its own administrator |
+| `none` | Any other backend | No protection, shown as a permanent warning on the dashboard |
+
+The wizard proposes `object-lock` whenever the backend supports it, because it is the only level that also survives a leaked account of the storage provider.
+The server verifies a declared level when the target is saved and again before every copy,
+by reading the bucket configuration and by trying to delete a probe object, which must fail.
+A declared level that fails verification stops the copy and raises a notification,
+because a silently unprotected copy is worse than a visible failure.
+Snapshots on a remote filesystem, such as ZFS on an SFTP host, count as `none`,
+because the server cannot verify them, and the administrator can acknowledge the warning per target.
+
+The protection period is configurable per target and defaults to 30 days.
+With `object-lock`, the server extends the retention of every object that is still referenced once less than half of the period remains,
+because an expired lock on a pack that a current snapshot still needs would make that snapshot deletable again.
+Pruned packs are deleted off-site only after their lock has expired,
+because an earlier deletion fails anyway and retrying it every run would only produce errors.
+In the re-encrypted mode, prune of the off-site repository keeps every pack younger than the protection period,
+using the option of `rustic_core` to keep recent packs, for the same reason.
+The storage overhead is the data pruned within one protection period, which is the price of the delay an attacker has to wait out.
+
+A compromised server can still stop copying without deleting anything,
+and its own notifications cannot be relied on in that case.
+The server therefore calls a configurable heartbeat URL after every successful off-site copy,
+so that a monitor outside the server reports when copies stop.
 
 ## Restore and rollback
 
@@ -609,7 +679,7 @@ Every feature needs an automated test before it counts as done, as required by G
 - Round-trip tests that back up, restore into a fresh container and compare checksums of files and the logical content of databases
 - Security tests that assert an `append-only` agent receives a rejection on `DELETE` and on overwriting an existing file,
   that the agent cannot write to `/host`, and that `/proc`, `/sys`, `/dev` and the Docker socket are absent inside the container
-- Fault injection for network loss during upload, server restart, agent kill, full disk on the NAS and expired certificates
+- Fault injection for network loss during upload, server restart, agent kill, full disk on the server storage and expired certificates
 - Compatibility tests that open repositories with the upstream `restic` and `rustic` CLIs, which verifies G6
 - VM tests with QEMU and a real distribution image, because a host-root bind mount and separate partitions cannot be reproduced faithfully inside nested containers
 - Isolation tests that assert a database worker sees no host files, a file worker joins no database network,
@@ -618,6 +688,9 @@ Every feature needs an automated test before it counts as done, as required by G
   that assert the host keeps its certificate and repository and that two management roles on one state volume are rejected
 - VM tests of the native agent that assert it cannot write outside its state directory and skips pseudo filesystems
 - Off-site tests against MinIO, an SFTP container and an `rclone` local remote, including a restore from the off-site copy alone
+- Off-site protection tests against MinIO with object lock and with versioning and against a `rest-server` in `--append-only` mode,
+  that assert the probe deletion fails, a misconfigured bucket stops the copy,
+  locks of referenced packs are extended and prune never deletes a locked pack
 - Every integration and VM test runs on `x86_64` and `aarch64`
 
 ## License
@@ -632,7 +705,7 @@ The license is compatible with `rustic_core`, which is dual licensed under Apach
 2. Management and worker agents, scheduling, retention, prune, check, notifications, PostgreSQL and MariaDB targets
 3. Snapshot browser, download, one-shot restore agent, database rollback
 4. MongoDB, Redis, SQLite, configuration presets, Docker volumes, custom commands
-5. Roles, TOTP, OIDC, audit log, metrics, configuration export, recovery kit, off-site copy
+5. Roles, TOTP, OIDC, audit log, metrics, configuration export, recovery kit, off-site copy with backend protection and heartbeat
 6. Native agent with install script and systemd unit
 7. Hardening review, VM test suite on `x86_64` and `aarch64`, documentation, first release
 
@@ -641,34 +714,42 @@ because every later feature builds on its guarantees.
 
 ## Open points
 
-### Reachability of the NAS
+### Reachability of the server
 
 #### Problem
 
-G2 requires the VPS hosts to reach the NAS, which usually sits behind a home router.
+G2 requires every agent host to reach the agent listener of the server,
+which can sit behind a home router, inside a company network or on a public address.
 
 #### Options
 
-- Port forwarding of the agent listener on the router
-- A VPN such as WireGuard or Tailscale between VPS hosts and NAS
-- A relay on a VPS that the NAS connects out to
+- Direct exposure of the agent listener, on a public address or through port forwarding
+- A VPN such as WireGuard or Tailscale between the agent hosts and the server
+- A relay on a public host that the server connects out to
 
 #### Approach
 
-A VPN with WireGuard or Tailscale between the VPS hosts and the NAS.
-The agent listener binds to the VPN interface, and the wizard uses the VPN address of the NAS as server URL.
-Port forwarding was rejected, because it exposes the agent listener to the internet and needs a dynamic DNS name for a changing home address.
-A relay was rejected, because it is one more component to build, secure and operate.
+Direct exposure and a VPN are both supported, and the deployment decides between them.
 The server design stays independent of the choice, because the agent only needs a reachable URL.
+The agent listener is designed to be exposed to the internet,
+because every endpoint except enrollment and the install script requires a client certificate,
+enrollment needs a one-time token and is rate limited, and the install script serves only public data.
+A server with a public address or a forwarded port therefore needs no VPN, and the wizard uses its DNS name as server URL.
+A VPN is recommended when the server sits behind a router without a stable public address, such as a NAS at home,
+because it avoids a dynamic DNS name and keeps the listener off the internet.
+The agent listener then binds to the VPN interface, and the wizard uses the VPN address of the server as server URL.
 The container agent reaches the VPN through the routing of the host,
 so the documentation recommends the VPN IP address over names like Tailscale MagicDNS, which containers do not resolve by default.
+A relay was rejected, because it is one more component to build, secure and operate, and a VPN covers the same case.
+The UI listener is never exposed by the wizard, because no agent function needs it.
 
-### NAS platform
+### Server platform
 
 #### Problem
 
-Synology, TrueNAS and Unraid differ in Docker version and filesystem features.
-`recursive: disabled` needs Docker 25 on the agent hosts, but the NAS Docker version limits the server container options.
+The server runs on NAS platforms such as Synology, TrueNAS and Unraid as well as on general Linux distributions and VMs,
+and these differ in Docker version and filesystem features.
+`recursive: disabled` needs Docker 25 on the agent hosts, but the Docker version of a NAS limits the server container options.
 
 #### Options
 
@@ -693,7 +774,14 @@ An `append-only` agent can decrypt its own backup history, because rustic uses a
 
 #### Approach
 
-Accept for the first version and revisit after milestone 6.
+Accepted, because the data originates from the same host and an attacker who controls the host can read its current state without the repository.
+Asymmetric encryption was rejected, because leaving the restic format breaks G6, which weighs more than hiding data from the host it came from.
+Separate repositories per time window were rejected,
+because every window loses deduplication against the previous ones, each rotation needs a full upload,
+and the agent still holds the key of the current window.
+The remaining risk is old data that the host has deleted since, such as removed accounts or rotated secrets.
+A target that must protect such data from its own host combines a short retention in the primary repository with a long retention in a re-encrypted off-site copy,
+because the agent never holds the key of the off-site repository.
 
 ### Database client versions in the agent image
 
@@ -765,7 +853,7 @@ Native agents update with the install command, which the UI shows without a toke
 
 #### Problem
 
-The server holds the off-site credentials, so a compromised NAS can delete the off-site copy as well,
+The server holds the off-site credentials, so a compromised server can delete the off-site copy as well,
 which weakens G7 against ransomware.
 
 #### Options
@@ -777,4 +865,10 @@ which weakens G7 against ransomware.
 
 #### Approach
 
-Not decided.
+Protection enforced by the backend through object lock, versioning or an append-only remote,
+as defined in the section on protection against a compromised server.
+Credentials without delete permission are part of the `versioning` level, because without versioning they would also block prune.
+Delayed deletion is used only to schedule deletions after a lock expires and not as protection on its own,
+because the server enforces it and a compromised server ignores it.
+Accepting the risk remains possible per target as level `none` with a permanent warning,
+because some backends offer no immutability and a visible unprotected copy is still better than none.
