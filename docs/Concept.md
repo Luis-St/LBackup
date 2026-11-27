@@ -53,12 +53,20 @@ because the confinement through capabilities, read-only mounts and systemd sandb
 | Worker agent | Linux host, Docker or native systemd service | Reads host data or creates dumps for its assigned targets, deduplicates, encrypts and uploads snapshots, and includes the management role unless it opts out |
 | Management agent | Linux host, Docker, optional, at most one per host | Holds the server connection and identity, receives configuration, schedules jobs and relays them to the workers of a host with more than one worker |
 | Restore agent | Linux host, Docker or native binary, one-shot | Writes a selected snapshot back to the host, started only on demand |
-| Web UI | Embedded in the server binary | Administration, agent enrollment wizard, browsing and restore |
+| Test agent | Dedicated Linux host, Docker or native binary, permanent | Runs scheduled restore tests in sandboxes it creates locally with Docker or libvirt |
+| Web UI | Embedded in the server binary | Administration, agent enrollment wizard, browsing and restore, built only on the REST API |
+| CLI | Admin machines and CI, static binary | `lbackupctl`, automation of every server function through the REST API |
 
 The server is a single Rust binary based on `tokio` and `axum`.
 The web UI is written in SvelteKit with `adapter-static` and embedded into the binary with `rust-embed`,
 because a single artifact without a separate web server keeps deployment and versioning simple.
 The server keeps its own state in SQLite via `sqlx`, because one installation runs exactly one server instance and an external database would add an operational dependency without benefit.
+
+The server exposes every function through a REST API described with OpenAPI, and the web UI uses only this API,
+because every action of the UI is then also available for automation and the API cannot fall behind the UI.
+The CLI `lbackupctl` is a separate static binary for `x86_64` and `aarch64`,
+because admin machines and CI runners need a small client without the server and its embedded UI.
+It authenticates with an API token, which the section on users, roles and permissions defines.
 
 The agent is a separate Rust binary that embeds `rustic_core` as a library.
 It runs as worker with embedded management, as worker only or as dedicated management agent,
@@ -235,6 +243,7 @@ Enforcement on the server side is required, because a compromised agent can igno
 | `backup-restore` | yes | only own lock files | yes, file content | Hosts where self-service restore is wanted |
 | `read-only` | no | no | yes | Verification or migration hosts |
 | `restore` | no | no | yes, limited to one snapshot | One-shot restore agent |
+| `restore-test` | no | no | yes, snapshots of the agents assigned to its tests | Test agent |
 
 `append-only` is the default, because a compromised agent host then cannot delete or rewrite its backup history.
 Deletion of data only happens on the server through retention and prune, which run locally on the server.
@@ -407,8 +416,9 @@ Unix sockets of databases live under `/run` and are therefore hidden.
 When a database only listens on a socket, the wizard adds a read-only bind mount of exactly that socket directory to the database worker.
 Connecting to a socket on a read-only mount works, because the read-only flag does not apply to socket inodes.
 
-The Docker socket is never mounted.
+The Docker socket is never mounted into the management agent or the file and database workers.
 It would grant full root on the host, which contradicts the purpose of the minimal capability set.
+Only a custom worker can receive it as an explicit opt-in, as defined in the section on custom exports.
 
 ## Native agent
 
@@ -535,6 +545,7 @@ The client tools ship in image variants per database family.
 | `lbackup-agent:<version>-mongodb` | `mongodump` |
 | `lbackup-agent:<version>-redis` | `redis-cli` |
 | `lbackup-agent:<version>-full` | All clients |
+| `lbackup-agent:<version>-custom` | Shell, `curl` and the `docker` CLI for custom exports |
 
 The wizard assigns each target to a worker with the smallest variant that covers it,
 and regenerates the compose file when a new target needs a worker that does not exist yet.
@@ -584,6 +595,46 @@ Commands are defined only on the server and the agent executes nothing that is n
 because an arbitrary command channel would turn the backup system into a remote shell.
 Commands run inside the worker the target is assigned to and with its restrictions, so they cannot write to the host.
 
+### Custom exports
+
+A custom export integrates an application that brings its own backup tool, such as mailcow or Artifactory.
+The target runs a command defined on the server, waits until it exits successfully and then backs up a configurable export directory.
+It complements the custom command target,
+because tools like the mailcow backup script write several files into a directory instead of one stream to standard output.
+
+Custom exports run in a dedicated custom worker, whose permissions are chosen in the wizard when the worker is created.
+
+| Permission | Example |
+| --- | --- |
+| Writable bind mount of the export directory | `/srv/backup-export/mailcow` |
+| Additional read-only bind mounts | The mailcow installation directory `/opt/mailcow-dockerized` |
+| Docker networks or the host network | The network of Artifactory, to call its export API |
+| Capabilities | Only what the command needs, none by default |
+| Docker socket | Required by the mailcow backup script, which starts its own containers |
+
+The permissions are fixed at container creation like every other mount and network,
+because a permission that could be pushed at runtime would let a compromised server widen the access of an agent without anyone touching the host.
+The custom worker is separate from the file and database workers,
+because only it holds write access and possibly the Docker socket, and the standard workers stay read-only.
+The Docker socket is an explicit opt-in in the wizard, and the UI shows a permanent warning that this worker is equivalent to root on its host.
+It is allowed despite the rule for the other workers,
+because applications like mailcow offer no consistent backup without starting containers,
+and a host cron job outside LBackup would bypass scheduling, logging and alerts.
+
+The custom worker uses the image variant `-custom`, which adds a shell, `curl` and the `docker` CLI,
+because export commands are usually shell scripts or API calls.
+An own image based on this variant is supported for commands that need further tools.
+
+What happens to the export directory after a successful upload is set per target.
+
+| Cleanup | Behavior |
+| --- | --- |
+| `keep` | The directory stays untouched, and the application manages its own cleanup |
+| `delete` | The content is removed after the snapshot was uploaded successfully |
+| `keep-latest` | Only the export of the last successful run stays |
+
+The cleanup never runs after a failed upload, because the export would then exist nowhere.
+
 ## Scheduling and execution
 
 - Cron expressions per target with a time zone, plus manual triggers from the UI
@@ -593,6 +644,36 @@ Commands run inside the worker the target is assigned to and with its restrictio
 - Bandwidth limit per agent and time window, because the traffic of rented servers is often metered
 - CPU and IO niceness of the agent process, which needs no capability because it only lowers priority
 - Live progress and logs streamed to the UI
+
+## Anomaly detection
+
+The server compares each new snapshot with the previous runs of the same target,
+because ransomware shows up as an unusual change in a backup before anyone notices it on the host.
+
+| Signal | Source | Detection |
+| --- | --- | --- |
+| Changed, new and deleted files | Snapshot summary | The count exceeds the rolling average of a configurable number of runs, 10 by default, by a configurable factor |
+| Upload size and deduplication | Server, from the written pack files | The uploaded size jumps or the deduplication and compression ratio drops, because encrypted files neither deduplicate nor compress |
+| Entropy and extensions | Agent, computed while chunking | Many changed files with high entropy or with extensions known from ransomware |
+| Missing paths | Snapshot trees | A configurable share of the previous tree is missing, which indicates mass deletion |
+
+Thresholds are configurable per target with defaults, because a log directory and a configuration directory have very different normal change rates.
+The entropy signal is computed by the agent, because only the agent sees file content in plaintext and it reads every changed file anyway.
+A compromised agent can falsify that signal,
+so the size and deduplication signal is computed by the server from the data actually written.
+
+The reactions are configurable per target.
+
+| Reaction | Effect |
+| --- | --- |
+| Alert | Raises an alert of the kind anomaly |
+| Legal hold | Places a legal hold on the last snapshot before the anomaly, so that the last known good state cannot be removed |
+| Pause retention | Stops retention and prune for the agent |
+| Pause off-site copy | Stops the off-site copy of the agent, so that the suspicious snapshot does not replace good data off-site |
+
+Only the alert is active by default,
+because legitimate large changes such as upgrades or migrations would otherwise create holds and stop maintenance.
+Paused actions continue once an administrator acknowledges the anomaly in the UI, and the acknowledgment is written to the audit log.
 
 ## Server side repository maintenance
 
@@ -604,6 +685,39 @@ Retention, prune and verification run on the server directly on the repository f
 - Cleanup of stale locks left by crashed agents
 - Storage quota per agent, because an `append-only` agent could otherwise fill the server storage
 - Repository statistics such as size, deduplication ratio and growth over time
+
+### Legal hold
+
+A legal hold protects snapshots from retention and prune, for example during an investigation or for a retention duty.
+A hold covers single snapshots or a rule of agent, target and time range, which also covers snapshots created later in that range.
+Each hold has a reason and an optional expiry date, and without one it stays until it is lifted.
+Setting and lifting a hold is a separate permission, because it overrides retention and is not part of routine administration.
+Held snapshots are also kept in the off-site copy.
+With the protection level `object-lock`, the server sets the S3 legal hold flag on the packs they reference,
+because a legal hold in object lock has no expiry and survives a compromised server in the same way as the retention period.
+Removing single files from old snapshots, for example for a GDPR request, is not offered,
+because it conflicts with legal holds and with the off-site protection levels, which deliberately prevent deleting data before the protection period ends.
+
+### Key rotation
+
+Repository keys are rotated on two levels.
+
+| Level | Procedure | Use |
+| --- | --- | --- |
+| Password rotation | The server adds a new password for the repository key, removes the old one and sends the new password to the agent | Routine, on a configurable interval or manually |
+| Re-key | The server creates a new repository with a new master key, copies all snapshots with `rustic copy`, switches the agent to it and deletes the old repository after a configurable period | After a compromise of the host or the server |
+
+Password rotation alone is not enough after a compromise,
+because the password only protects the master key, which stays the same and which a compromised agent has held in memory.
+The re-key runs on the server and costs the decryption and encryption of the whole repository once.
+The old repository is kept for the configurable period, because it stays the reference if the copy turns out to be incomplete.
+Legal holds carry over to the snapshots in the new repository.
+A mirror off-site copy shares the key of the primary repository, so a re-key also starts a new mirror,
+and the old mirror is deleted once its protection period allows it.
+A re-encrypted off-site copy has its own key and is not affected by a re-key of the primary repository.
+After a compromise of a host, the re-key is combined with revoking its client certificate and enrolling the host again,
+because a new key does not help while the attacker still holds a valid identity.
+After a compromise of the server, every repository is re-keyed, because the server held every password.
 
 ### Off-site copy
 
@@ -637,6 +751,7 @@ Each off-site target declares one of the following protection levels.
 | `object-lock` | S3-compatible storage with object lock | Every uploaded object gets a retention period in compliance mode, so neither the server nor the account owner can delete it earlier |
 | `versioning` | S3-compatible storage with versioning and credentials without the right to delete object versions | A deletion only hides the current version, and a lifecycle rule of the bucket removes old versions after the protection period |
 | `append-only-remote` | A restic REST server in `--append-only` mode, reached through the `restic` remote of `rclone` | The remote side rejects every deletion, and pruning happens there by its own administrator |
+| `peer-delayed-delete` | A peer LBackup server | The peer moves deleted files into a trash and removes them only after the protection period |
 | `none` | Any other backend | No protection, shown as a permanent warning on the dashboard |
 
 The wizard proposes `object-lock` whenever the backend supports it, because it is the only level that also survives a leaked account of the storage provider.
@@ -661,6 +776,42 @@ and its own notifications cannot be relied on in that case.
 The server therefore calls a configurable heartbeat URL after every successful off-site copy,
 so that a monitor outside the server reports when copies stop.
 
+### Peer servers
+
+A second LBackup server can serve as an off-site backend for a primary server.
+The peer only stores the encrypted repositories and never receives their passwords,
+so it can neither browse nor restore them, and a compromised peer reveals no data.
+Every server can be a peer for other servers in addition to serving its own agents,
+because two homelabs that back each other up are a common case and a dedicated storage mode would need a second installation.
+A primary is enrolled at the peer like an agent, with a one-time token created on the peer and a client certificate,
+and reaches the peer over its agent listener.
+The copy uses the mirror or the re-encrypted mode like every other off-site backend.
+
+The peer enforces the protection level `peer-delayed-delete`.
+The primary may request deletions after a prune,
+but the peer moves the files into a trash and removes them only after the protection period, 30 days by default.
+Strict append-only was rejected, because the peer holds no password and could never prune, so the copy would grow without end.
+The delay is enforced by the peer and not by the primary, so a compromised primary cannot wipe the copy.
+The primary verifies the level with the same probe deletion, after which the probe object must stay readable on the peer.
+The peer applies a storage quota per primary server, because a primary could otherwise fill the storage of the peer.
+
+### Cold disks
+
+Rotating USB or other disks connected to the server host serve as offline off-site backends,
+because a disk stored at another location is out of reach of an attacker and of the provider of a cloud backend.
+Disks are registered in the UI by the UUID of their LUKS header and form a set per off-site target.
+When a registered disk is connected, the server unlocks and mounts it, runs the copy and unmounts and locks it again,
+so that the disk can be unplugged right afterwards.
+LUKS is required on every cold disk in addition to the restic encryption,
+because a lost disk would otherwise reveal repository structure, sizes and snapshot times.
+The server holds the LUKS keys encrypted in its database and in the recovery kit, like every other secret.
+Unlocking and mounting needs device access and `CAP_SYS_ADMIN` in the server container,
+which the server receives only when cold disks are enabled.
+A helper on the host was rejected, because it would add a second component to install and update outside the server container.
+The copy mode is mirror or re-encrypted copy like for every other off-site target.
+A cold disk has no protection level, because it is protected by being disconnected,
+and the dashboard shows the time since the last copy for each disk instead.
+
 ## Restore and rollback
 
 Restores are started from the UI and never by the permanently running agent in `append-only` mode.
@@ -681,17 +832,105 @@ because overwriting live data in place is a decision the administrator confirms 
 Database rollbacks restore a dump into a database chosen in the wizard, by default a new database with a suffix,
 so that the current state stays available for comparison until the administrator switches over.
 
+## Restore tests
+
+Restore tests prove on a schedule that snapshots can actually be restored,
+because `check` only verifies the repository structure and not whether a database or application starts from the restored data.
+
+### Test agent
+
+Restore tests run on a test agent, which is enrolled like any agent with the test flag `--restore-test` and stays connected permanently.
+The server assigns it the `restore-test` mode, which lets it read the snapshots of the agents assigned to its tests and never write to a repository.
+The test agent runs on a dedicated machine and never on the server host or a production host,
+because it creates sandboxes with Docker or libvirt and therefore needs the Docker socket or the libvirt socket, which are root on that machine.
+This keeps the server and the backup agents free of these privileges.
+The test agent receives the repository password of a tested agent only for the duration of a test and keeps it in memory,
+but it can read the data of every agent assigned to it, so its machine must be trusted to the same degree as the server.
+
+| Sandbox | Creation | Use |
+| --- | --- | --- |
+| Docker | Containers on the test machine, for example a PostgreSQL server of the same major version | Files, databases and containerized applications |
+| VM | A libvirt or QEMU VM from a base image configured per test | Restores that need a full system, such as a host with systemd services or separate partitions |
+
+Sandboxes have no network access except to the test agent by default,
+because a restored application such as a mail server must never contact production systems or send mail.
+Every sandbox is removed after the test, also after a failure, so that restored data does not stay on the test machine.
+
+### Scheduled tests
+
+Each scheduled test chooses an agent, its targets, the snapshot, by default the latest one, the sandbox and the checks that run.
+
+| Check | Verification |
+| --- | --- |
+| Checksums | Restored file content is compared against the content hashes in the snapshot metadata |
+| Database restore and query | The dump is restored into a fresh database server and a configurable query, such as a row count, must return the expected result |
+| Custom script | A command defined on the server runs in the sandbox after the restore, such as an HTTP health check of a restarted application |
+
+The checks are chosen per test, because a database target needs a restore and a query while a file target only needs checksums.
+Results with duration and failed checks are stored per test, shown on the dashboard and raise alerts.
+
 ## Server administration and UI
 
 - Dashboard with last run, next run, status and size per agent and target
 - Agent wizard, agent list with version, connection state and applied configuration version
 - Target and schedule editor with a dry run that lists what would be backed up
-- Users with roles `admin`, `operator` and `viewer`, passwords hashed with Argon2id
+- Users with roles per scope and API tokens, as defined below, passwords hashed with Argon2id
 - TOTP as second factor and optional OIDC login for an existing identity provider
-- Audit log of every configuration change, restore, download and revocation
-- Notifications on failure, missed runs and quota warnings via email, webhook, ntfy and Gotify
+- Audit log of every configuration change, restore, download, revocation, legal hold and key rotation,
+  where each entry names the acting user, API token, agent or server together with its role or mode at that time
+- Alert rules and summary reports, as defined below
 - Prometheus metrics endpoint for external monitoring
 - Export and import of the full configuration as TOML, so that the setup can be versioned in Git
+
+### Users, roles and permissions
+
+Permissions are granted as a role per scope, where the scope is global, an agent group or a single agent,
+because in a company or on a public backup server a team should manage its own hosts without seeing the others.
+
+| Role | Permissions within the scope |
+| --- | --- |
+| `admin` | Everything except the separate permissions, including users, agents, targets and off-site targets |
+| `operator` | Run backups, start restores and restore tests, download files and acknowledge anomalies |
+| `viewer` | Dashboard, logs, snapshot lists and reports, without browsing file content or downloads |
+
+| Separate permission | Reason |
+| --- | --- |
+| `legal-hold` | Setting or lifting a hold overrides retention |
+| `key-rotation` | A re-key deletes the old repository and replaces the mirror off-site copy |
+
+The separate permissions are not part of any role, not even `admin`, and are granted per scope,
+because both act against the normal life cycle of the data and should be held by few people.
+Fixed roles were chosen over freely defined ones, because every combination of permissions needs a test and a fixed set keeps that manageable.
+The snapshot browser, downloads, alerts and reports respect the scope, so a user only sees the agents of the scopes assigned.
+OIDC groups can be mapped to role assignments, so that membership is maintained in the identity provider.
+
+API tokens carry a role and a scope like a user, have an optional expiry and can be revoked in the UI,
+and every use of a token is written to the audit log,
+because a token used by a pipeline acts without a person present and must remain traceable.
+
+### Alerts
+
+Alerts are configured as rules, because different people are responsible for different hosts and kinds of events.
+Each rule selects the event kinds, a scope of agents, a minimum severity and the recipients.
+
+| Event kind | Examples |
+| --- | --- |
+| Backup | Failed run, missed run, quota warning |
+| Restore test | Failed check, test not run |
+| Anomaly | A signal crossed its threshold |
+| Off-site | Failed copy, failed protection verification |
+| Security | Revoked agent, failed certificate renewal, repeated login failures, finished key rotation |
+
+Alerts are delivered by email, webhook, ntfy and Gotify.
+Mail is sent through an SMTP server configured on the server.
+
+### Summary reports
+
+Summary reports are sent by mail daily, weekly or monthly, with recipients and a scope of agents per report.
+A report contains successful, failed and missed runs, the latest restore test results, anomalies,
+storage growth, quota usage and the status of the off-site copies and cold disks.
+It is sent as HTML mail with a PDF attachment, because a PDF can be archived as evidence for audits.
+A report can be limited to periods in which something needs attention, because a daily report without findings is quickly ignored.
 
 ## Security of the server
 
@@ -701,7 +940,8 @@ so that the current state stays available for comparison until the administrator
 - A recovery kit export containing the repository passwords and the master key, protected by a passphrase,
   because losing the server database must not make the repositories unreadable
 - Rate limiting on login and enrollment endpoints
-- The server container also runs read-only with all capabilities dropped and only the repository and state directories writable
+- The server container also runs read-only with all capabilities dropped and only the repository and state directories writable,
+  except for device access and `CAP_SYS_ADMIN` when cold disks are enabled
 
 ## Testing
 
@@ -729,6 +969,19 @@ Every feature needs an automated test before it counts as done, as required by G
 - Off-site protection tests against MinIO with object lock and with versioning and against a `rest-server` in `--append-only` mode,
   that assert the probe deletion fails, a misconfigured bucket stops the copy,
   locks of referenced packs are extended and prune never deletes a locked pack
+- Custom export tests with a sample application that asserts the export directory is backed up,
+  each cleanup mode behaves as configured and a failed upload never triggers the cleanup
+- Restore test tests that run every check in a Docker and a VM sandbox,
+  including a deliberately corrupted snapshot that must fail, and assert that the sandbox has no network and is removed afterwards
+- Anomaly tests that simulate ransomware by encrypting and renaming a file tree and assert that every signal and each configured reaction triggers
+- Alert and report tests against a local SMTP test server that assert rule scopes and the content of the PDF report
+- Key rotation tests that assert the old password is rejected after a password rotation,
+  and that a re-key keeps every snapshot, carries over legal holds and leaves a repository readable with the upstream `restic` CLI
+- Legal hold tests that assert retention and prune never remove a held snapshot and that the S3 legal hold flag is set off-site
+- Peer tests with two servers that assert the peer cannot read any data, deletions are delayed by the protection period and the quota holds
+- Cold disk tests in a VM with a LUKS loop device that assert the disk is unlocked, copied and locked again on connect
+- Permission tests that assert every role and separate permission per scope through the REST API and through `lbackupctl`,
+  and that each audit log entry names the actor and its role
 - Every integration and VM test runs on `x86_64` and `aarch64`
 
 ## License
@@ -739,12 +992,15 @@ The license is compatible with `rustic_core`, which is dual licensed under Apach
 
 ## Milestones
 
-1. Workspace, protocol crate, server with SQLite, UI skeleton, enrollment with mutual TLS, file targets in `append-only` mode
-2. Management and worker agents, scheduling, retention, prune, check, notifications, PostgreSQL and MariaDB targets
-3. Snapshot browser, download, one-shot restore agent, database rollback
-4. MongoDB, Redis, SQLite, configuration presets, Docker volumes, custom commands
-5. Roles, TOTP, OIDC, audit log, metrics, configuration export, recovery kit, off-site copy with backend protection and heartbeat, remote primary storage
-6. Native agent with install script and systemd unit
+1. Workspace, protocol crate, server with SQLite, REST API with OpenAPI, UI skeleton on that API,
+   enrollment with mutual TLS, file targets in `append-only` mode
+2. Management and worker agents, scheduling, retention, prune, check, alert rules, anomaly detection, PostgreSQL and MariaDB targets
+3. Snapshot browser, download, one-shot restore agent, database rollback, test agent with scheduled restore tests
+4. MongoDB, Redis, SQLite, configuration presets, Docker volumes, custom commands, custom worker with custom exports
+5. Roles with scopes, API tokens, `lbackupctl`, TOTP, OIDC, audit log, metrics, configuration export, recovery kit,
+   legal hold, key rotation, summary reports
+6. Off-site copy with backend protection and heartbeat, peer servers, cold disks, remote primary storage,
+   native agent with install script and systemd unit
 7. Hardening review, VM test suite on `x86_64` and `aarch64`, documentation, first release
 
 The order puts the safety-critical path of enrollment and `append-only` writes first,
@@ -827,6 +1083,7 @@ and the agent still holds the key of the current window.
 The remaining risk is old data that the host has deleted since, such as removed accounts or rotated secrets.
 A target that must protect such data from its own host combines a short retention in the primary repository with a long retention in a re-encrypted off-site copy,
 because the agent never holds the key of the off-site repository.
+After a compromise of the host, a re-key as defined in the section on key rotation replaces the master key the attacker has seen.
 
 ### Database client versions in the agent image
 
@@ -917,3 +1174,21 @@ Delayed deletion is used only to schedule deletions after a lock expires and not
 because the server enforces it and a compromised server ignores it.
 Accepting the risk remains possible per target as level `none` with a permanent warning,
 because some backends offer no immutability and a visible unprotected copy is still better than none.
+
+### Event-triggered backups
+
+#### Problem
+
+Some backups should run right before an event on the host, such as an `apt upgrade` or a deploy,
+with a selection of targets per event.
+
+#### Options
+
+- A local CLI command that asks the running agent over a socket to run the targets of an event defined on the server
+- A trigger through the REST API with a token, for example from a CI pipeline
+- A trigger that waits until the backup has finished, so that a failed backup can abort the upgrade
+
+#### Approach
+
+Deferred until after the first release,
+because scheduled and manual backups cover the regular case and the trigger builds on the REST API and its tokens, which are only complete in milestone 5.
