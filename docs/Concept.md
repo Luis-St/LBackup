@@ -134,6 +134,8 @@ because exposing the administration interface to the internet is not required by
 The agent implements the backend traits of `rustic_core` with its own backend that talks to the server's repository API.
 The API follows the restic REST server protocol, so the semantics are well understood and a stock `rest-server` can serve as a reference in tests.
 A custom backend was chosen over the stock rustic REST backend because it reuses the agent's mutual TLS identity and lets the server enforce per-agent modes on every request.
+The server computes the SHA-256 of every upload while streaming it and rejects a file whose name does not match its content,
+because the hash costs no extra I/O and a mismatch found by `check` weeks later can no longer be traced to the request that caused it.
 
 ### Enrollment
 
@@ -534,6 +536,8 @@ because a file copy of a running database is not consistent and the database tar
 
 Dumps are streamed directly into `rustic_core` as a stdin-style source, so no temporary dump file is written.
 This matters because the agent filesystem is read-only and a dump can be larger than the available `tmpfs`.
+The agent writes the snapshot of a stream only after the source process has exited successfully and the dump verification, if enabled, has passed,
+because a truncated dump is not a usable state and the server must not forget snapshots on behalf of an agent.
 
 The client tools ship in image variants per database family.
 
@@ -594,11 +598,15 @@ A target can run a command whose standard output is backed up, for example an ap
 Commands are defined only on the server and the agent executes nothing that is not part of its signed configuration,
 because an arbitrary command channel would turn the backup system into a remote shell.
 Commands run inside the worker the target is assigned to and with its restrictions, so they cannot write to the host.
+The output of a command is a stream like a database dump, so its snapshot is written only after the command has exited successfully.
+Every command has a configurable timeout per target, 6 hours by default, after which the process is killed and the job fails,
+because a hanging command would otherwise block its worker and every later job of that worker would be missed.
 
 ### Custom exports
 
 A custom export integrates an application that brings its own backup tool, such as mailcow or Artifactory.
 The target runs a command defined on the server, waits until it exits successfully and then backs up a configurable export directory.
+The command has the same timeout as a custom command, because a hanging export blocks its worker in the same way.
 It complements the custom command target,
 because tools like the mailcow backup script write several files into a directory instead of one stream to standard output.
 
@@ -983,7 +991,8 @@ The [LBackup Test Concept](TestConcept.md) defines the test cases per milestone 
 - Cold disk tests in a VM with a LUKS loop device that assert the disk is unlocked, copied and locked again on connect
 - Permission tests that assert every role and separate permission per scope through the REST API and through `lbackupctl`,
   and that each audit log entry names the actor and its role
-- Every integration and VM test runs on `x86_64` and `aarch64`
+- Every integration and VM test runs on `x86_64` and on native `aarch64` runners,
+  because emulation with QEMU makes the suite impractically slow and changes timing, which could hide or create race conditions
 
 ## License
 

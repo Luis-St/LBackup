@@ -167,7 +167,7 @@ Workspace, protocol crate, server with SQLite, REST API with OpenAPI, UI skeleto
 | P1-F4 | Client certificate from another CA, self-signed, expired or revoked | The connection is rejected, a revoked agent is disconnected immediately |
 | P1-F5 | Evil agent A requests paths of agent B, including `..`, `%2e%2e`, doubled slashes and absolute paths | Every request is rejected and never reaches the files of agent B |
 | P1-F6 | Evil agent in `append-only` mode sends `DELETE` on data, index, snapshot, key and config files, on foreign locks and overwrites an existing file with different content | Every request is rejected, I2 and I3 hold |
-| P1-F7 | Evil agent uploads a file whose name is not the SHA-256 of its content | Rejected, see the open point on content verification |
+| P1-F7 | Evil agent uploads a file whose name is not the SHA-256 of its content | Rejected, as defined in the data path section of the concept |
 | P1-F8 | Evil agent sends wrong `Content-Length`, a truncated body or an endless body | The request fails, no file appears under its final name |
 | P1-F9 | Failpoint kills the agent after every step of a backup | No partial file exists under a final name, the next run succeeds, I1 to I3 hold |
 | P1-F10 | Server restart during enrollment and during an upload | Enrollment can be repeated with a new token, the backup is retried and succeeds |
@@ -220,7 +220,7 @@ The worker cache is tested here, because it arrives with the workers.
 | P2-F7 | Migration stopped after every step of the guide | The guide shows the step as not done, and the host recovers by finishing or reverting the step |
 | P2-F8 | Clock jumps forward and backward, server restart at the minute of a scheduled run | No slot runs twice and none is lost except by the missed-run policy |
 | P2-F9 | Transactional workload with a constant total during the dump | The restored database satisfies the invariant |
-| P2-F10 | Database killed or network cut during a dump | The job is marked failed and the partial snapshot never counts as a good state, see the open point on partial streams |
+| P2-F10 | Database killed or network cut during a dump | The job is marked failed and the partial snapshot never counts as a good state, because no snapshot is written for a failed stream |
 | P2-F11 | Search for database credentials after a job | No canary credential remains in the state volume, the cache or `/proc/<pid>/environ` of the worker |
 | P2-F12 | Compromised agent reports low entropy while encrypting | The server-side size and deduplication signal still fires |
 | P2-F13 | Slow ransomware that encrypts a small share per run below every threshold | The test records the share at which detection starts, which documents the detection limit instead of claiming none |
@@ -286,7 +286,7 @@ MongoDB, Redis, SQLite, configuration presets, Docker volumes, custom commands, 
 | P4-F3 | A command that is not in the signed configuration, sent by a man in the middle or written into the cached configuration of the state volume | The agent refuses to run it |
 | P4-F4 | A custom command or export tries to write below `/host` | The write fails |
 | P4-F5 | Export command exits non-zero, upload fails at every failpoint | No snapshot counts as good and no cleanup runs |
-| P4-F6 | Export command never exits | The job ends after a timeout, see the open point on command timeouts |
+| P4-F6 | Export command never exits | The process is killed after the configured timeout and the job fails |
 | P4-F7 | Export directory contains a symlink to a path outside it | The link is stored as a link, `delete` cleanup does not follow it |
 
 Mutation testing covers the configuration signature check and the cleanup decision.
