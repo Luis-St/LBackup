@@ -277,6 +277,7 @@ services:
           propagation: rprivate
           recursive: disabled
       - lbackup-agent-state:/state
+      - lbackup-agent-cache:/cache
     environment:
       LBACKUP_SERVER: https://10.8.0.1:8443
       LBACKUP_SERVER_FINGERPRINT: sha256:0000000000000000000000000000000000000000000000000000000000000000
@@ -284,6 +285,7 @@ services:
 
 volumes:
   lbackup-agent-state:
+  lbackup-agent-cache:
 ```
 
 After the migration to a second worker, the same host runs a dedicated management agent,
@@ -334,6 +336,7 @@ services:
           propagation: rprivate
           recursive: disabled
       - lbackup-agent-socket:/socket:ro
+      - lbackup-agent-cache:/cache
 
   lbackup-worker-postgres:
     <<: *hardening
@@ -346,6 +349,7 @@ services:
       - app-db
     volumes:
       - lbackup-agent-socket:/socket:ro
+      - lbackup-worker-postgres-cache:/cache
 
 networks:
   app-db:
@@ -354,6 +358,8 @@ networks:
 volumes:
   lbackup-agent-state:
   lbackup-agent-socket:
+  lbackup-agent-cache:
+  lbackup-worker-postgres-cache:
 ```
 
 The dedicated management agent and the database workers run without any capability and without a host mount,
@@ -364,6 +370,19 @@ UID 0 without capabilities on a read-only root filesystem grants no access beyon
 It remains host root after a container escape, which is accepted because the file worker already runs as UID 0 for the same reason.
 The socket volume is mounted read-only into the workers,
 because connecting to a Unix socket works on a read-only mount and the workers never need to write there.
+
+Every worker mounts its own cache volume at `/cache`, which holds the rustic cache of index, snapshot and tree files.
+Without it every run would download the index and the trees of the parent snapshot again,
+which costs time and traffic on metered links and grows with the size of the repository.
+The cache holds the repository files exactly as stored on the server, so it contains no plaintext and needs no protection beyond the repository encryption.
+It is a separate volume and not part of the state volume,
+because it can be deleted at any time without losing the identity of the host and it never moves during a topology migration.
+The file worker keeps the volume `lbackup-agent-cache` across the migration, so its first run afterwards finds a warm cache.
+A worker that starts with an empty cache only pays one full download of the metadata.
+The agent caps the cache at a configurable size, 2 GB by default, and evicts the least recently used files,
+because a Docker named volume has no size limit of its own and must not fill the disk of the host.
+The management agent has no cache volume, because it never opens the repository.
+Placing the cache in the `/tmp` `tmpfs` was rejected, because it is lost on every restart and its 256 MB are too small for large repositories.
 
 `DAC_READ_SEARCH` is the only capability of the file worker, because it lets the agent read every file regardless of permissions and nothing else.
 `DAC_OVERRIDE` is not added, because it also grants write access, which a backup agent never needs.
@@ -429,6 +448,7 @@ ExecStart=/usr/local/bin/lbackup-agent
 User=lbackup
 Group=lbackup
 StateDirectory=lbackup-agent
+CacheDirectory=lbackup-agent
 AmbientCapabilities=CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 NoNewPrivileges=yes
@@ -456,6 +476,8 @@ which gives the same read access as the container agent without running as root.
 Ambient capabilities survive `NoNewPrivileges`, because they do not depend on file capabilities or setuid.
 `ProtectSystem=strict` makes the whole filesystem read-only for the service except its `StateDirectory`,
 which replaces the read-only bind mount of the container variant.
+`CacheDirectory` creates `/var/cache/lbackup-agent` as the writable cache location, with the same role and size cap as the cache volume of the container agent.
+It is kept apart from the `StateDirectory`, because the cache is disposable and the state is not.
 A plain root service was rejected, because a compromised agent would then own the host.
 
 The native agent sees `/proc`, `/sys`, `/dev`, `/run` and every other mount, because no mount namespace hides them.
@@ -698,7 +720,9 @@ Every feature needs an automated test before it counts as done, as required by G
   and the management agent rejects worker names missing from its configuration
 - Migration tests from one to two workers and back, with and without keeping the management agent,
   that assert the host keeps its certificate and repository and that two management roles on one state volume are rejected
-- VM tests of the native agent that assert it cannot write outside its state directory and skips pseudo filesystems
+- VM tests of the native agent that assert it cannot write outside its state and cache directories and skips pseudo filesystems
+- Cache tests that assert a run with a deleted or corrupt cache succeeds, the size cap holds,
+  and a run with a warm cache downloads no index or tree files that are already cached
 - Primary storage tests with a local directory, an NFS share and MinIO as remote backend,
   that assert mode enforcement and quotas behave the same on all three
 - Off-site tests against MinIO, an SFTP container and an `rclone` local remote, including a restore from the off-site copy alone
