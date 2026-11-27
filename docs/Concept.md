@@ -946,6 +946,7 @@ A report can be limited to periods in which something needs attention, because a
 ## Testing
 
 Every feature needs an automated test before it counts as done, as required by G5.
+The [LBackup Test Concept](TestConcept.md) defines the test cases per milestone and the rules that make them reproducible.
 
 - Unit tests for configuration parsing, mode enforcement, retention calculation and protocol messages
 - Integration tests with Docker Compose that start the server, several agents and sample services,
